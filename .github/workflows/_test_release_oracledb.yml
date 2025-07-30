@@ -1,4 +1,4 @@
-name: release
+name: release-oracledb
 run-name: Release ${{ inputs.working-directory }} by @${{ github.actor }}
 on:
   workflow_call:
