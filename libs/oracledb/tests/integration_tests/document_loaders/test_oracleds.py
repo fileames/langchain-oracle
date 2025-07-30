@@ -27,7 +27,6 @@ uname = ""
 passwd = ""
 v_dsn = ""
 
-
 try:
     oracledb.connect(user=uname, password=passwd, dsn=v_dsn)
 except Exception as e:
