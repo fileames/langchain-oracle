@@ -81,7 +81,7 @@ jobs:
 
       - name: Validate built package
         run: |
-          pip install dist/*.whl
+          pip install ${{ inputs.working-directory }}/dist/*.whl
           python -c "import ${{ needs.build.outputs.pkg-name }}"
 
       - name: Upload to TestPyPI
@@ -90,7 +90,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.GH_LC_OCI_TESTPYPI_TOKEN }}
         run: |
           pip install twine
-          twine upload --repository-url https://test.pypi.org/legacy/ dist/* -u $TWINE_USERNAME -p $TWINE_PASSWORD
+          twine upload --repository-url https://test.pypi.org/legacy/ ${{ inputs.working-directory }}/dist/* -u $TWINE_USERNAME -p $TWINE_PASSWORD
 
   pre-release-checks:
     needs:
@@ -204,7 +204,7 @@ jobs:
 
       - name: Validate
         run: |
-          pip install dist/*.whl
+          pip install ${{ inputs.working-directory }}/dist/*.whl
           python -c "import ${{ needs.build.outputs.pkg-name }};"
 
       - name: Publish distribution 📦 to PyPI
@@ -213,13 +213,4 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.GH_LC_OCI_PYPI_TOKEN }}
         run: |
           pip install twine
-          twine upload dist/* -u $TWINE_USERNAME -p $TWINE_PASSWORD
-
-
-      - name: Upload to TestPyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.GH_LC_OCI_TESTPYPI_TOKEN }}
-        run: |
-          pip install twine
-          twine upload dist/* -u $TWINE_USERNAME -p $TWINE_PASSWORD
+          twine upload ${{ inputs.working-directory }}/dist/* -u $TWINE_USERNAME -p $TWINE_PASSWORD
