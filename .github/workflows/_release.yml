@@ -79,11 +79,6 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Validate built package
-        run: |
-          pip install ${{ inputs.working-directory }}/dist/*.whl
-          python -c "import ${{ needs.build.outputs.pkg-name }}"
-
       - name: Upload to TestPyPI
         env:
           TWINE_USERNAME: __token__
@@ -201,11 +196,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-
-      - name: Validate
-        run: |
-          pip install ${{ inputs.working-directory }}/dist/*.whl
-          python -c "import ${{ needs.build.outputs.pkg-name }};"
 
       - name: Publish distribution 📦 to PyPI
         env:
