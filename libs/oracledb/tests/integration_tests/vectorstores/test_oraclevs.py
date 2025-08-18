@@ -35,9 +35,11 @@ from langchain_oracledb.vectorstores.oraclevs import (
     drop_table_purge,
 )
 
-username = ""
-password = ""
-dsn = ""
+import os
+
+username = os.getenv("GH_USERNAME") 
+password = os.getenv("GH_PASSWORD") 
+dsn = os.getenv("GH_DSN") 
 
 try:
     oracledb.connect(user=username, password=password, dsn=dsn)

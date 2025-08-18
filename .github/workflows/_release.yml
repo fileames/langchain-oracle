@@ -156,6 +156,10 @@ jobs:
 
       - name: Run integration tests
         run: make integration_tests
+        env:
+          GH_USERNAME: ${{ secrets.GH_USERNAME }} 
+          GH_PASSWORD: ${{ secrets.GH_PASSWORD }} 
+          GH_DSN: ${{ secrets.GH_DSN }} 
         working-directory: ${{ inputs.working-directory }}
 
       - name: Get minimum versions
