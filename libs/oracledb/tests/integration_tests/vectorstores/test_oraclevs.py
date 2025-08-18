@@ -10,6 +10,7 @@ with OracleVS.
 # import required modules
 import asyncio
 import logging
+import os
 import sys
 import threading
 
@@ -35,15 +36,16 @@ from langchain_oracledb.vectorstores.oraclevs import (
     drop_table_purge,
 )
 
-import os
+username = os.getenv("GH_USERNAME")
+password = os.getenv("GH_PASSWORD")
+dsn = os.getenv("GH_DSN")
 
-username = os.getenv("GH_USERNAME") 
-password = os.getenv("GH_PASSWORD") 
-dsn = os.getenv("GH_DSN") 
+print(username, password)
 
 try:
     oracledb.connect(user=username, password=password, dsn=dsn)
 except Exception as e:
+    print(e)
     pytest.skip(
         allow_module_level=True,
         reason=f"Database connection failed: {e}, skipping tests.",
