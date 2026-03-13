@@ -1,6 +1,9 @@
 # langchain-oracledb
 
-This package contains the LangChain integrations with [Oracle AI Vector Search](https://www.oracle.com/database/ai-vector-search/).
+This package contains LangChain integrations for Oracle AI Database, including
+[Oracle AI Vector Search](https://www.oracle.com/database/ai-vector-search/),
+chat message history, semantic caching, document processing, embeddings, and
+summary generation.
 
 ## Installation
 
@@ -74,6 +77,68 @@ create_index(
 # perform siliarity search
 vs.similarity_search("How does a database stores LOBs?", 1)
 
+```
+
+### Caches
+
+#### OracleSemanticCache
+
+Cache prompt responses in Oracle AI Database using `OracleSemanticCache`. 
+
+```python
+from langchain_core.embeddings import DeterministicFakeEmbedding
+from langchain_core.outputs import Generation
+
+from langchain_oracledb import OracleSemanticCache
+
+cache = OracleSemanticCache(
+    client=connection,
+    embedding=DeterministicFakeEmbedding(size=6),
+    table_name="langchain_semantic_cache",
+    score_threshold=0.0,
+)
+
+cache.update(
+    "What is Oracle AI Database?",
+    "model=demo",
+    [Generation(text="Oracle AI Database is Oracle Database with built-in AI features.")],
+)
+
+cached = cache.lookup("What is Oracle AI Database?", "model=demo")
+print(cached)
+```
+
+### Chat message histories
+
+#### OracleChatMessageHistory
+
+Persist chat conversations in Oracle Database using
+`OracleChatMessageHistory`. 
+
+```python
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from langchain_oracledb import OracleChatMessageHistory
+
+OracleChatMessageHistory.create_tables(connection, "langchain_chat_history")
+
+chat_history = OracleChatMessageHistory(
+    session_id="session-123",
+    client=connection,
+    table_name="langchain_chat_history",
+    create_table=False,
+    create_index=False,
+)
+
+chat_history.add_messages(
+    [
+        SystemMessage(content="You are a helpful assistant."),
+        HumanMessage(content="Hello"),
+        AIMessage(content="Hi! How can I help?"),
+    ]
+)
+
+print(chat_history.messages)
 ```
 
 ### Document Loaders
