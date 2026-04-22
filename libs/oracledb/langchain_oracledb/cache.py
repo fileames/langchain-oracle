@@ -43,6 +43,39 @@ def _dumps_generations(generations: RETURN_VAL_TYPE) -> str:
     return json.dumps([dumps(item) for item in generations])
 
 
+def _reset_generation_ids(generations: RETURN_VAL_TYPE) -> None:
+    """Clear the ``.id`` on cached chat messages before returning them.
+
+    Cached ``AIMessage``s keep whatever ``id`` they had at write time.
+    When LangChain caching is wired into a LangGraph agent, the graph's
+    ``add_messages`` reducer dedupes by ``id``: a cached message with an
+    id already present in state replaces the existing one instead of
+    being appended, and state stops progressing. Dropping the id on load
+    matches how a fresh LLM call would behave (the runtime mints a new
+    ``lc_run--<uuid>`` id when the message is emitted).
+    """
+    for gen in generations:
+        message = getattr(gen, "message", None)
+        if message is not None and getattr(message, "id", None) is not None:
+            try:
+                message.id = None
+            except (AttributeError, TypeError):
+                pass
+
+
+def _has_tool_calls(generations: RETURN_VAL_TYPE) -> bool:
+    """Return True if any generation carries a tool-call message."""
+    for gen in generations:
+        message = getattr(gen, "message", None)
+        if message is None:
+            continue
+        if getattr(message, "tool_calls", None):
+            return True
+        if getattr(message, "invalid_tool_calls", None):
+            return True
+    return False
+
+
 def _loads_generations(generations_str: str) -> Union[RETURN_VAL_TYPE, None]:
     """Deserialize a sequence of `Generation` objects."""
     try:
@@ -150,10 +183,24 @@ class OracleSemanticCache(BaseCache):
         return_val = document.metadata.get(self.RETURN_VAL)
         if not isinstance(return_val, str):
             return None
-        return _loads_generations(return_val)
+        generations = _loads_generations(return_val)
+        if generations is not None:
+            _reset_generation_ids(generations)
+        return generations
 
     def update(self, prompt: str, llm_string: str, return_val: RETURN_VAL_TYPE) -> None:
-        """Insert or update a semantic cache entry."""
+        """Insert or update a semantic cache entry.
+
+        Generations whose message carries ``tool_calls`` are intentionally
+        **not** cached. Tool-call responses are procedural (one step inside
+        an agent loop, not a final answer), and replaying them collapses
+        agent state: a cached tool-call ``AIMessage`` keeps its original
+        ``id``, LangGraph's ``add_messages`` reducer dedupes by ``id``, and
+        the graph fails to advance past the tool node.
+        """
+        if _has_tool_calls(return_val):
+            return
+
         metadata = {
             self.PROMPT_HASH: _hash_value(prompt),
             self.LLM_HASH: _hash_value(llm_string),
