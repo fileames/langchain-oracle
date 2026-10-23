@@ -49,6 +49,131 @@ print("Connection successful!")
 
 ### Vector Stores
 
+#### OracleVS backends and VecDB
+
+`OracleVS` defaults to `backend="auto"`. With a native connection, it checks the
+Oracle Database version and the availability of `DBMS_VECTOR_DATABASE.SEARCH`.
+New tables use VecDB on supported databases (23.26.1+), and SQL otherwise.
+Existing ordinary OracleVS tables continue using SQL. Explicit `backend="sql"`
+and `backend="vecdb"` overrides are available. VecDB currently accepts schema-local,
+simple table names. The existing SQL backend retains its identifier support.
+
+REST uses the optional Oracle VecDB SDK:
+
+```bash
+pip install "langchain-oracledb[vecdb]"
+```
+
+The REST extra requires Python 3.10–3.15. SQL-only installation continues to
+support Python 3.9. The SDK is imported only when needed.
+
+```python
+import os
+from oracle_vecdb import Configuration
+from langchain_oracledb import OracleVS
+
+# embedding_model implements LangChain's Embeddings interface.
+config = Configuration(
+    rest_url=os.environ["ORACLE_VECDB_REST_URL"],
+    username=os.environ["ORACLE_VECDB_USERNAME"],
+    password=os.environ["ORACLE_VECDB_PASSWORD"],
+    # Alternatively use access_token=... without username/password.
+)
+store = OracleVS.from_vecdb_config(
+    config=config,
+    table_name="DOCUMENTS",
+    embedding=embedding_model,
+    mutate_on_duplicate=True,
+)
+store.add_texts(["Oracle vector search"], ids=["doc-1"])
+documents = store.similarity_search("vector search", k=4)
+```
+
+You can also pass an existing `OracleVecDB` as `client`; it remains caller-owned.
+The SDK supports REST only. Native connections use a private PL/SQL executor.
+For REST clients, API availability establishes VecDB support. The adapter uses
+only operations exposed by the public `oracle-vecdb` SDK. Unsupported operations
+raise clear errors; there is no secondary connection parameter or automatic
+fallback to another transport.
+
+REST ingestion uses the SDK's upsert operation and therefore requires the existing
+`mutate_on_duplicate=True` option. Insert-only writes are not supported by this
+SDK. SDK documents and metadata are mapped to the same LangChain IDs. Search
+scores retain OracleVS's lower-is-better distance convention, and requested
+distance metrics are sent explicitly to VecDB.
+
+VecDB stores document text under the reserved metadata key `text`, in `METADATA`
+on 23.26.1/23.26.2 or `CONTENT_METADATA` on 23.26.3+. User metadata must not contain
+`text` or the existing internal document-ID key. Text is returned as
+`Document.page_content`, including long documents, without the reserved field in
+`Document.metadata`. No additional document table is created.
+
+`OracleTextSearchRetriever` searches only `$.text` using `JSON_TEXTCONTAINS`.
+`create_text_index(..., vector_store=store)` replaces VecDB's metadata guide index
+with a text-enabled JSON search index when necessary. It preserves the physical
+index name, data-guide callback, synchronization schedule, and other catalog
+parameters; only the `SEARCH_ON` mode changes to `TEXT`. An existing text or
+hybrid index is reused. Matches are ordered by ID; `return_scores=True` returns
+a Boolean match score of 1.0.
+
+`create_hybrid_index` replaces the guide or text-only index with an Oracle hybrid
+vector index on the metadata column. It retains the existing physical name and
+compatible parameters, including
+`DATAGUIDE ON CHANGE SYS.DBMS_VECTOR_DATABASE.HANDLE_MVI_INDEX`. Model-backed
+VecDB preferences default to the `$.text` string path. Explicit hybrid parameters
+can override memory and maintenance settings, but cannot change the inherited
+synchronization schedule or remove the VecDB data-guide callback. A live check
+with `SYNC (ON COMMIT)` and newly introduced metadata paths failed during ingestion;
+sync overrides and conversion of an existing `ON COMMIT` index to HVI are
+rejected before replacement. The separate `DENSE_VECTOR` index is retained.
+
+VecDB owns the physical metadata-index name. When an index already exists, the
+helpers preserve that name even if a different `idx_name` is requested. The hybrid
+retriever discovers the actual HVI on the store's metadata column, so existing
+retriever calls continue working. Repeated requests reuse an existing HVI;
+requesting text indexing afterward does not downgrade it. No index is replaced
+merely by constructing a store.
+
+`OracleHybridSearchRetriever` executes `DBMS_HYBRID_VECTOR.SEARCH`; Oracle Database
+performs ranking and returns overall/text/vector scores. There is no application
+fusion. The REST SDK does not expose metadata text search, native hybrid search,
+metadata text/hybrid index creation, vectorizer preferences, or schema migration;
+those operations raise unsupported-operation errors for SDK clients. They remain
+available for stores constructed with an oracledb connection/pool as `client`.
+Model-backed HVI creates its own embeddings rather than automatically reusing `DENSE_VECTOR`.
+
+Index replacement uses DDL and requires a connection without pending application
+work. Queries may be unavailable between drop and recreation; concurrent index
+DDL is not supported. If creation fails, the adapter attempts to recreate the
+original JSON search index with its previous parameters and raises the error.
+Recovery is best effort, not transactional rollback; a recovery failure explicitly
+requires manual intervention. Unknown index configurations and foreign data-guide
+callbacks are rejected before dropping anything.
+
+The inherited synchronization schedule governs text, hybrid, and data-guide
+freshness. VecDB's default is every 30 seconds, so committed changes need not
+appear immediately in those indexes. SQL-only stores keep their existing behavior.
+Replacement and new-path MVI generation were validated on DB 23.26.4.1 / SDK
+1.0.6; official VecDB lifecycle compatibility and older DB versions remain
+unconfirmed.
+
+After an upgrade to 23.26.3+, queries against recognized legacy VecDB layouts
+may trigger migration: rename `METADATA`, add the three missing content/sparse
+columns, re-inspect, and retry once. Only a missing current-layout column error
+qualifies, and only the missing actions run. This preserves data and supports
+interrupted migrations. Migration is supported only for native `client`
+connections without pending application work because Oracle DDL implicitly commits. A recognized layout
+error through the REST SDK reports that schema migration is unsupported.
+Authentication, network, and unrelated query errors never trigger migration or backend fallback.
+
+Opt-in REST integration tests use `ORACLE_VECDB_REST_URL` with either
+`ORACLE_VECDB_ACCESS_TOKEN` or `ORACLE_VECDB_USERNAME`/`ORACLE_VECDB_PASSWORD`.
+`ORACLE_VECDB_CA_CERT` optionally supplies a trusted CA bundle. Tests use unique
+temporary tables and drop them afterward. Index lifecycle tests additionally use
+`ORACLE_VECDB_NATIVE_DSN` and username/password for a native store. The hybrid
+lifecycle test also needs `ORACLE_VECDB_HYBRID_MODEL`, naming an installed database
+embedding model.
+
 #### OracleVS
 
 Use Oracle Vector Database with `OracleVS`. More information can be found in [Oracle AI Vector Search: Vector Store](https://python.langchain.com/docs/integrations/vectorstores/oracle/) documentation.
