@@ -29,7 +29,6 @@ from langchain_oracledb.vectorstores._vecdb import (
     native_selection,
     parse_version,
     table_identifier,
-    validate_filter,
 )
 from langchain_oracledb.vectorstores.utils import DistanceStrategy
 
@@ -84,12 +83,24 @@ def test_version(version, expected):
     assert parse_version(version) == expected
 
 
-@pytest.mark.parametrize(
-    "name", ["DOCS; DROP TABLE x", 'x"y', "schema.docs", " ", "DOCS) --"]
-)
-def test_identifiers_reject_sql(name):
+@pytest.mark.parametrize("name", ['x"y', " ", "schema..docs", '"unclosed'])
+def test_identifiers_reject_malformed_names(name):
     with pytest.raises(ValueError):
         table_identifier(name)
+
+
+@pytest.mark.parametrize(
+    "name, quoted, api_name",
+    [
+        ('"हिन्दी"', '"हिन्दी"', "हिन्दी"),
+        ("schema.docs", '"schema"."docs"', "schema.docs"),
+        ('"literal.dot"', '"literal.dot"', "literal.dot"),
+        ("DOCS; DROP TABLE x", '"DOCS; DROP TABLE x"', "DOCS; DROP TABLE x"),
+        ("DOCS) --", '"DOCS) --"', "DOCS) --"),
+    ],
+)
+def test_identifiers_preserve_shared_quoting(name, quoted, api_name):
+    assert table_identifier(name) == (quoted, api_name)
 
 
 def test_optional_sdk_not_imported_by_sql_package():
@@ -112,11 +123,14 @@ def test_factory_reports_missing_sdk():
             OracleVS.from_vecdb_config(object(), "DOCS", Embedding())
 
 
-def selection_connection(version, columns, supported=True):
+def selection_connection(version, columns, supported=True, compatible="23.6.0.0.0"):
     connection = MagicMock(version=version)
     cursor = connection.cursor.return_value.__enter__.return_value
     cursor.fetchall.return_value = [(column,) for column in columns]
     cursor.fetchone.return_value = (int(supported),)
+    cursor.var.side_effect = lambda *args, **kwargs: MagicMock(
+        getvalue=MagicMock(return_value=compatible)
+    )
     return connection, cursor
 
 
@@ -192,14 +206,28 @@ def test_rest_store_roundtrip_mapping_without_metadata_mutation(store, sdk):
 def test_reserved_text_key_and_bad_batch_do_not_write(store, sdk):
     with pytest.raises(ValueError, match="reserved"):
         store.add_texts(["hello"], [{"text": "user value"}])
-    with pytest.raises(ValueError, match="batch sizes"):
-        store.add_texts(["hello"], ids=[])
+    with pytest.raises(ValueError, match="Length mismatch"):
+        store.add_texts(["hello"], ids=["one", "two"])
     sdk.upsert_vectors.assert_not_called()
 
 
 def test_empty_batch_does_not_write(store, sdk):
     assert store.add_texts([]) == []
     sdk.upsert_vectors.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_vecdb_uses_shared_empty_id_and_metadata_defaults(
+    store, sdk, asynchronous
+):
+    ids = (
+        await store.aadd_texts(["hello"], metadatas=[], ids=[])
+        if asynchronous
+        else store.add_texts(["hello"], metadatas=[], ids=[])
+    )
+    assert len(ids) == 1 and ids[0]
+    assert sdk.upsert_vectors.call_args.kwargs["vectors"][0]["id"] == ids[0]
 
 
 def test_insert_only_rest_requires_native_instead_of_racy_upsert(sdk):
@@ -221,8 +249,18 @@ def test_get_pages_id_batches_and_delete(store, sdk):
     ]
     store.delete(["a"])
     sdk.delete_vectors.assert_called_once_with(table_name="DOCS", ids=["a"])
-    with pytest.raises(ValueError):
-        store.delete([])
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_delete_validation_is_delegated_to_the_sdk(store, sdk, asynchronous):
+    sdk.delete_vectors.side_effect = ValueError("SDK rejected the IDs")
+    with pytest.raises(ValueError, match="SDK rejected the IDs"):
+        if asynchronous:
+            await store.adelete([])
+        else:
+            store.delete([])
+    sdk.delete_vectors.assert_called_once_with(table_name="DOCS", ids=[])
 
 
 def test_return_embeddings(store):
@@ -359,17 +397,104 @@ def test_generation_specific_index_json():
         new.index_params({"accuracy": 101})
 
 
-def test_filter_rejects_operators_paths_and_nonfinite_values():
-    for value in [
-        {"$sql": "x"},
-        {"a.b": 3},
-        {"text": "x"},
-        {"a": {"$in": []}},
-        {"a": float("nan")},
-    ]:
-        with pytest.raises(ValueError):
-            validate_filter(value)
-    assert validate_filter({"$and": [{"tenant": "one"}, {"size": {"$gt": 2}}]})
+@pytest.mark.parametrize(
+    "kind, invalid",
+    [
+        ("HNSW", {"accuracy": 0}),
+        ("HNSW", {"accuracy": True}),
+        ("HNSW", {"neighbors": 1}),
+        ("HNSW", {"efConstruction": 65536}),
+        ("IVF", {"neighbor_part": 0}),
+        ("IVF", {"parallel": 0}),
+    ],
+)
+def test_index_parameter_validation_matches_existing_sql(kind, invalid):
+    from langchain_oracledb.vectorstores.oraclevs import (
+        _get_hnsw_index_ddl,
+        _get_ivf_index_ddl,
+    )
+
+    params = {"idx_type": kind, **invalid}
+    sql_builder = _get_hnsw_index_ddl if kind == "HNSW" else _get_ivf_index_ddl
+    backend = VecDBBackend(
+        NativeTransport(None, (23, 26, 3)), "DOCS", DistanceStrategy.COSINE
+    )
+    with pytest.raises(ValueError) as sql_error:
+        sql_builder('"DOCS"', DistanceStrategy.COSINE, params)
+    with pytest.raises(ValueError) as vecdb_error:
+        backend.index_params(params)
+    assert str(vecdb_error.value) == str(sql_error.value)
+
+
+def test_existing_index_options_are_translated_for_the_sdk(store, sdk):
+    sdk.create_index = MagicMock(return_value={"message": "created"})
+    store._vecdb.create_index({"idx_type": "ivf", "neighbor_part": 32, "parallel": 2})
+    mapped = sdk.create_index.call_args.kwargs["index_params"]
+    assert mapped["parallel_creation"] == 2
+    assert mapped["vector_index_params"]["organization"] == "PARTITIONS"
+    assert mapped["vector_index_params"]["advanced_params"] == {"partitions": 32}
+
+
+def test_additional_index_option_validation_is_delegated_to_the_sdk(store, sdk):
+    sdk.create_index = MagicMock(
+        side_effect=ValueError("SDK rejected the index option")
+    )
+    with pytest.raises(ValueError, match="SDK rejected the index option"):
+        store._vecdb.create_index({"unknown_option": True})
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"address": {"city": "NYC"}},
+        {"address.city": "NYC"},
+        {"tags[*]": {"$all": ["a", "b"]}},
+        {"size": {"$between": [1, 10]}},
+        {"name": {"$regex": "^Oracle"}},
+        {"$nor": [{"tenant": "one"}, {"size": {"$gt": 2}}]},
+    ],
+)
+def test_vecdb_filters_are_forwarded_without_an_adapter_whitelist(store, sdk, filters):
+    store.similarity_search("query", filter=filters)
+    assert sdk.query.call_args.kwargs["filters"] is filters
+
+
+def test_vecdb_filter_errors_come_from_the_sdk(store, sdk):
+    sdk.query.side_effect = ValueError("SDK rejected the filter")
+    with pytest.raises(ValueError, match="SDK rejected the filter"):
+        store.similarity_search("query", filter={"$unknown": "x"})
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_native_text_limit_is_bound_instead_of_interpolated(asynchronous):
+    transport = (
+        AsyncNativeTransport(None, (23, 26, 3))
+        if asynchronous
+        else NativeTransport(None, (23, 26, 3))
+    )
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    limit = "1; DROP TABLE DOCS"
+    if asynchronous:
+        transport.acolumns = AsyncMock(return_value=CURRENT_COLUMNS)
+        cursor.execute = AsyncMock()
+        cursor.fetchall = AsyncMock(return_value=[])
+        with patch(
+            "langchain_oracledb.vectorstores._vecdb._aget_connection"
+        ) as acquire:
+            acquire.return_value.__aenter__.return_value = connection
+            await transport.atext_search("DOCS", "oracle", limit)
+    else:
+        transport.columns = MagicMock(return_value=CURRENT_COLUMNS)
+        cursor.fetchall.return_value = []
+        with patch("langchain_oracledb.vectorstores._vecdb._get_connection") as acquire:
+            acquire.return_value.__enter__.return_value = connection
+            transport.text_search("DOCS", "oracle", limit)
+    sql = cursor.execute.call_args.args[0]
+    assert "FETCH FIRST :k ROWS ONLY" in sql
+    assert limit not in sql
+    assert cursor.execute.call_args.kwargs["k"] == limit
 
 
 def test_text_retriever_uses_metadata_backend(store):
@@ -615,14 +740,6 @@ def test_from_texts_propagates_backend_ids_and_mutation_mode(sdk):
     assert sdk.upsert_vectors.call_args.kwargs["vectors"][0]["id"] == "custom"
 
 
-@pytest.mark.parametrize(
-    "value", [{1: "x"}, {"a": {"$eq": {"$sql": "x"}}}, {"a": {"$in": [{"$eq": 1}]}}]
-)
-def test_filter_rejects_structured_comparison_values(value):
-    with pytest.raises(ValueError):
-        validate_filter(value)
-
-
 def test_layout_error_checks_actual_missing_column_not_request_context():
     assert layout_error(
         RuntimeError('ORA-00904: "T"."CONTENT_METADATA": invalid identifier')
@@ -646,7 +763,11 @@ def test_native_pool_initialization_does_not_acquire_a_second_connection():
     cursor = connection.cursor.return_value.__enter__.return_value
     cursor.fetchall.return_value = []
     cursor.fetchone.return_value = (1,)
-    cursor.var.return_value.getvalue.return_value = '{"table_name":"DOCS"}'
+    cursor.var.side_effect = lambda kind, **kwargs: MagicMock(
+        getvalue=MagicMock(
+            return_value=("23.6.0.0.0" if kind is str else '{"table_name":"DOCS"}')
+        )
+    )
     acquired = False
 
     @contextmanager

@@ -250,3 +250,64 @@ def test_rest_sdk_reports_unsupported_sql_operations(vecdb_store):
     for operation in operations:
         with pytest.raises(ValueError, match="oracle-vecdb REST SDK does not support"):
             operation()
+
+
+def test_native_auto_falls_back_when_compatible_is_below_sparse_requirement():
+    """A new SQL store is usable even when the VecDB package is installed."""
+    import oracledb
+
+    from langchain_oracledb.vectorstores._vecdb import parse_version
+
+    dsn = os.environ.get("VECDB_HOST")
+    if not dsn:
+        pytest.skip(
+            "Set VECDB_HOST, VECDB_USER and VECDB_PASS for native fallback checks"
+        )
+    with oracledb.connect(
+        user=os.environ["VECDB_USER"], password=os.environ["VECDB_PASS"], dsn=dsn
+    ) as connection:
+        with connection.cursor() as cursor:
+            db_version = cursor.var(str, size=128)
+            compatible = cursor.var(str, size=128)
+            cursor.execute(
+                "BEGIN DBMS_UTILITY.DB_VERSION(:version, :compatible); END;",
+                version=db_version,
+                compatible=compatible,
+            )
+        if parse_version(connection.version) < (23, 26, 3) or parse_version(
+            compatible.getvalue()
+        ) >= (23, 6, 0):
+            pytest.skip("This regression requires current VecDB with COMPATIBLE <23.6")
+        table = "LCN_COMP_" + uuid.uuid4().hex[:12].upper()
+        try:
+            with pytest.raises(ValueError, match=r"COMPATIBLE >= 23\.6\.0"):
+                OracleVS(connection, FixedEmbeddings(), table, backend="vecdb")
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM user_tables WHERE table_name=:name",
+                    name=table,
+                )
+                assert cursor.fetchone()[0] == 0
+            store = OracleVS(
+                connection,
+                FixedEmbeddings(),
+                table,
+                backend="auto",
+                mutate_on_duplicate=True,
+            )
+            assert store.backend == "sql" and store._vecdb is None
+            store.add_texts(["oracle database"], ids=["one"])
+            reopened = OracleVS(connection, FixedEmbeddings(), table, backend="auto")
+            assert reopened.backend == "sql"
+            assert reopened.get_by_ids(["one"])[0].page_content == "oracle database"
+            assert reopened.similarity_search("oracle")[0].id == "one"
+            reopened.delete(["one"])
+            assert reopened.get_by_ids(["one"]) == []
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT table_name FROM user_tables WHERE table_name=:name",
+                    name=table,
+                )
+                if cursor.fetchone():
+                    cursor.execute(f'DROP TABLE "{table}" PURGE')

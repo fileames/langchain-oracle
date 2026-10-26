@@ -19,25 +19,27 @@ import numpy as np
 import oracledb
 from langchain_core.documents import Document
 
-from .utils import DistanceStrategy, _aget_connection, _get_connection
+from .utils import (
+    DistanceStrategy,
+    _aget_connection,
+    _get_connection,
+    _quote_indentifier,
+)
 
 logger = logging.getLogger(__name__)
 
 TEXT_KEY = "text"
 LEGACY_VERSION = (23, 26, 1)
 CURRENT_VERSION = (23, 26, 3)
+DENSE_COMPATIBLE = (23, 4, 0)
+SPARSE_COMPATIBLE = (23, 6, 0)
+COMPATIBILITY_SQL = "BEGIN DBMS_UTILITY.DB_VERSION(:db_version, :compatibility); END;"
 BASE_COLUMNS = {"ID", "DENSE_VECTOR"}
 CURRENT_COLUMNS = BASE_COLUMNS | {
     "CONTENT_METADATA",
     "SPARSE_VECTOR",
     "CONTENT",
     "CONTENT_TYPE",
-}
-METRICS = {
-    DistanceStrategy.EUCLIDEAN_DISTANCE: "EUCLIDEAN",
-    DistanceStrategy.COSINE: "COSINE",
-    DistanceStrategy.DOT_PRODUCT: "DOT",
-    DistanceStrategy.MAX_INNER_PRODUCT: "DOT",
 }
 
 
@@ -49,13 +51,9 @@ def parse_version(version: str) -> tuple[int, ...]:
 
 
 def table_identifier(name: str) -> tuple[str, str]:
-    """Require one schema-local identifier; return SQL and API forms."""
-    value = name.strip()
-    if value.startswith('"') and value.endswith('"'):
-        value = value[1:-1]
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_$#]{0,127}", value):
-        raise ValueError("VecDB table/index names must be simple Oracle identifiers")
-    return f'"{value}"', value
+    """Use the shared identifier handling; return SQL and API forms."""
+    quoted = _quote_indentifier(name)
+    return quoted, quoted.replace('"', "")
 
 
 def as_dict(response: Any) -> dict[str, Any]:
@@ -81,60 +79,15 @@ def rows(response: Any, key: str) -> list[dict[str, Any]]:
 
 
 def document(row: dict[str, Any]) -> Document:
+    from .oraclevs import INTERNAL_ID_KEY
+
     metadata = dict(row.get("metadata") or {})
     text = metadata.pop(TEXT_KEY, None)
     if not isinstance(text, str) or not isinstance(row.get("id"), str):
         raise ValueError("VecDB document is missing its ID or metadata text")
     # The SQL backend's private ID field is not part of public metadata.
-    metadata.pop("__orcl_internal_doc_id", None)
+    metadata.pop(INTERNAL_ID_KEY, None)
     return Document(id=row["id"], page_content=text, metadata=metadata)
-
-
-def validate_filter(value: Optional[dict]) -> Optional[dict]:
-    """Constrain QBE operators/paths; pass user values as JSON, never SQL."""
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("VecDB filters must be dictionaries")
-    operators = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists"}
-
-    def scalar(item: Any) -> bool:
-        return item is None or isinstance(item, (str, bool, int, float))
-
-    for key, operand in value.items():
-        if not isinstance(key, str):
-            raise ValueError("VecDB filter keys must be strings")
-        if key in {"$and", "$or"}:
-            if not isinstance(operand, list) or not operand:
-                raise ValueError("Logical filters require a nonempty list")
-            for item in operand:
-                validate_filter(item)
-        elif key.startswith("$"):
-            raise ValueError(f"Unsupported VecDB filter operator: {key}")
-        else:
-            if key == TEXT_KEY or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                raise ValueError(
-                    "VecDB filters require flat, non-reserved metadata keys"
-                )
-            if isinstance(operand, dict):
-                if not operand or not set(operand) <= operators:
-                    raise ValueError("Unsupported VecDB comparison operator")
-                for op, arg in operand.items():
-                    if op in {"$in", "$nin"} and (not isinstance(arg, list) or not arg):
-                        raise ValueError("Membership filters require a nonempty list")
-                    if op == "$exists" and not isinstance(arg, bool):
-                        raise ValueError("$exists requires a boolean")
-                    if op in {"$in", "$nin"}:
-                        if not all(scalar(item) for item in arg):
-                            raise ValueError("Membership filters require scalar values")
-                    elif not scalar(arg):
-                        raise ValueError(
-                            "VecDB comparison operands must be scalar values"
-                        )
-            elif not scalar(operand):
-                raise ValueError("VecDB filter values must be scalars or comparisons")
-    json.dumps(value, allow_nan=False)
-    return value
 
 
 def _columns_sql() -> str:
@@ -573,11 +526,11 @@ class NativeTransport:
         sql = (
             f"SELECT id, {meta} FROM {quoted} "
             f"WHERE JSON_TEXTCONTAINS({meta}, '$.text', :query) "
-            f"ORDER BY id FETCH FIRST {k} ROWS ONLY"
+            "ORDER BY id FETCH FIRST :k ROWS ONLY"
         )
         with _get_connection(self.client) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, query=query)
+                cursor.execute(sql, query=query, k=k)
                 return [
                     document({"id": str(row[0]), "metadata": row[1]})
                     for row in cursor.fetchall()
@@ -607,6 +560,29 @@ def is_sdk_client(client: Any) -> bool:
         cls.__module__.startswith("oracle_vecdb.") and cls.__name__ == "OracleVecDB"
         for cls in type(client).__mro__
     )
+
+
+def _compatible_backend(
+    version: tuple[int, ...], compatibility: str, kind: str, backend: str
+) -> str:
+    minimum = SPARSE_COMPATIBLE if version >= CURRENT_VERSION else DENSE_COMPATIBLE
+    if parse_version(compatibility) < minimum:
+        required = ".".join(map(str, minimum))
+        if backend == "vecdb" or kind == "vecdb":
+            message = (
+                f"VecDB requires COMPATIBLE >= {required}; "
+                f"configured value is {compatibility}"
+            )
+            if kind == "vecdb":
+                message += ". An existing VecDB table cannot use the SQL backend."
+            raise ValueError(message)
+        logger.info(
+            "Using SQL backend: COMPATIBLE %s is below VecDB requirement %s",
+            compatibility,
+            required,
+        )
+        return "sql"
+    return "vecdb"
 
 
 def native_selection(
@@ -645,18 +621,27 @@ def native_selection(
             raise ValueError(
                 "Current VecDB table layout cannot be used on a legacy database"
             )
-        return "vecdb", version
+        db_version = cursor.var(str, size=128)
+        compatibility = cursor.var(str, size=128)
+        cursor.execute(
+            COMPATIBILITY_SQL, db_version=db_version, compatibility=compatibility
+        )
+        return _compatible_backend(
+            version, compatibility.getvalue(), kind, backend
+        ), version
 
 
 class VecDBBackend:
     def __init__(self, transport: Any, name: str, metric: DistanceStrategy):
         self.transport = transport
         self.quoted, self.name = table_identifier(name)
-        if metric not in METRICS:
-            raise ValueError(
-                "VecDB dense embeddings support COSINE, EUCLIDEAN, and DOT"
-            )
-        self.metric = METRICS[metric]
+        from .oraclevs import _get_distance_function
+
+        self.metric = _get_distance_function(
+            DistanceStrategy.DOT_PRODUCT
+            if metric == DistanceStrategy.MAX_INNER_PRODUCT
+            else metric
+        )
 
     def prepare(self) -> None:
         if isinstance(self.transport, NativeTransport):
@@ -696,16 +681,12 @@ class VecDBBackend:
     ) -> list[dict]:
         if not texts:
             return []
-        if not (len(texts) == len(vectors) == len(metadatas) == len(ids)):
-            raise ValueError("Text, embedding, metadata, and ID batch sizes must match")
+        if len(texts) != len(vectors):
+            raise ValueError("Text and embedding batch sizes must match")
         records = []
         for text, vector, metadata, id_ in zip(texts, vectors, metadatas, ids):
-            if not isinstance(id_, str) or not id_.strip():
-                raise ValueError("VecDB IDs must be nonblank strings")
-            if TEXT_KEY in metadata or "__orcl_internal_doc_id" in metadata:
+            if TEXT_KEY in metadata:
                 raise ValueError("Document metadata contains a reserved key")
-            if not vector or not all(math.isfinite(v) for v in vector):
-                raise ValueError("VecDB embeddings must contain finite numbers")
             records.append(
                 {
                     "id": id_,
@@ -713,7 +694,6 @@ class VecDBBackend:
                     "metadata": {**metadata, TEXT_KEY: text},
                 }
             )
-        json.dumps(records, allow_nan=False)
         return records
 
     def add(
@@ -745,18 +725,12 @@ class VecDBBackend:
         include_vectors: bool = False,
         **kwargs: Any,
     ) -> list:
-        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-            raise ValueError("k must be a positive integer")
-        if kwargs.get("db_filter") is not None:
-            if filter is not None:
-                raise ValueError("Specify only one of filter and db_filter")
-            filter = kwargs["db_filter"]
         response = self.query(
             "search",
             table_name=self.name,
             query_by={"vector": embedding},
             top_k=k,
-            filters=validate_filter(filter),
+            filters=filter,
             include_vectors=include_vectors,
             advanced_options={"distance_metric": self.metric},
         )
@@ -793,13 +767,9 @@ class VecDBBackend:
         return result
 
     def delete(self, ids: Optional[list[str]]) -> None:
-        if not ids:
-            raise ValueError("VecDB deletion requires a nonempty list of IDs")
         self.transport.call("delete_vectors", table_name=self.name, ids=ids)
 
     def text_search(self, query: str, k: int) -> list[Document]:
-        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-            raise ValueError("k must be a positive integer")
         return self.transport.text_search(self.name, query, k)
 
     def native_transport(
@@ -818,18 +788,24 @@ class VecDBBackend:
         self.native_transport("text index creation").create_text_index(self.name, index)
 
     def index_params(self, params: Optional[dict]) -> dict:
+        from .oraclevs import (
+            _validate_index_type,
+            _validate_int_param,
+            _validate_vector_index_common,
+        )
+
         params = dict(params or {})
-        kind = params.pop("idx_type", "HNSW")
-        if kind not in {"HNSW", "IVF"}:
-            raise ValueError("VecDB idx_type must be HNSW or IVF")
+        kind = params.get("idx_type", "HNSW")
+        kind = "IVF" if isinstance(kind, str) and kind.upper() == "IVF" else "HNSW"
+        _validate_index_type(params, kind)
+        params.setdefault("idx_name", kind)
+        _validate_vector_index_common(params)
+        params.pop("idx_type", None)
         params.pop("idx_name", None)  # VecDB owns the physical index name.
         accuracy = params.pop("accuracy", 90)
-        if (
-            isinstance(accuracy, bool)
-            or not isinstance(accuracy, int)
-            or not 0 <= accuracy <= 100
-        ):
-            raise ValueError("Index accuracy must be between 0 and 100")
+        parallel = params.pop("parallel", None)
+        if kind == "IVF" and "partitions" in params:
+            params.setdefault("neighbor_part", params.pop("partitions"))
         mapped: dict[str, Any] = {
             "organization": "INMEMORY GRAPH" if kind == "HNSW" else "PARTITIONS",
             "distance_metric": self.metric,
@@ -837,30 +813,30 @@ class VecDBBackend:
         }
         advanced = {}
         ranges = (
-            {"neighbors": (1, 2048), "efConstruction": (1, 65535)}
+            {"neighbors": (2, 2048), "efConstruction": (1, 65535)}
             if kind == "HNSW"
-            else {"partitions": (1, 10000000)}
+            else {"neighbor_part": (1, 10000000)}
         )
         for key, (low, high) in ranges.items():
+            _validate_int_param(params, key, low, high)
             if key in params:
-                value = params.pop(key)
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or not low <= value <= high
-                ):
-                    raise ValueError(f"Invalid VecDB index parameter: {key}")
-                advanced[key] = value
-        if params:
-            raise ValueError(f"Unsupported VecDB index options: {sorted(params)}")
+                advanced["partitions" if key == "neighbor_part" else key] = params.pop(
+                    key
+                )
+        mapped.update(params)  # The SDK/database validates additional options.
         if advanced:
             mapped["advanced_params"] = advanced
         if getattr(self.transport, "version", CURRENT_VERSION) < CURRENT_VERSION:
             mapped["indexing"] = "auto"
+            if parallel is not None:
+                mapped["parallel_creation"] = parallel
             return mapped
         mapped["auto_index"] = True
         mapped["organization"] = "INMEMORY GRAPH" if kind == "HNSW" else "PARTITIONS"
-        return {"vector_index_params": mapped}
+        result: dict[str, Any] = {"vector_index_params": mapped}
+        if parallel is not None:
+            result["parallel_creation"] = parallel
+        return result
 
     def create_index(self, params: Optional[dict]) -> None:
         self.transport.call(
@@ -909,8 +885,6 @@ class VecDBBackend:
             )
             return ids
         if method == "delete":
-            if not args[0]:
-                raise ValueError("VecDB deletion requires a nonempty list of IDs")
             await self.transport.acall(
                 "delete_vectors", table_name=self.name, ids=args[0]
             )
@@ -932,18 +906,12 @@ class VecDBBackend:
         if method == "search":
             embedding, k, filter = args[:3]
             include = args[3] if len(args) > 3 else False
-            if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-                raise ValueError("k must be a positive integer")
-            if kwargs.get("db_filter") is not None:
-                if filter is not None:
-                    raise ValueError("Specify only one of filter and db_filter")
-                filter = kwargs["db_filter"]
             response = await self.aquery(
                 "search",
                 table_name=self.name,
                 query_by={"vector": embedding},
                 top_k=k,
-                filters=validate_filter(filter),
+                filters=filter,
                 include_vectors=include,
                 advanced_options={"distance_metric": self.metric},
             )
@@ -952,8 +920,6 @@ class VecDBBackend:
             return await self.transport.ahybrid_search(self.name, *args)
         if method == "text_search":
             query, k = args
-            if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-                raise ValueError("k must be a positive integer")
             return await self.transport.atext_search(self.name, query, k)
         raise ValueError("Unsupported async VecDB operation")
 
@@ -1156,11 +1122,11 @@ class AsyncNativeTransport(NativeTransport):
         sql = (
             f"SELECT id, {meta} FROM {quoted} "
             f"WHERE JSON_TEXTCONTAINS({meta}, '$.text', :query) "
-            f"ORDER BY id FETCH FIRST {k} ROWS ONLY"
+            "ORDER BY id FETCH FIRST :k ROWS ONLY"
         )
         async with _aget_connection(self.client) as connection:
             with connection.cursor() as cursor:
-                await cursor.execute(sql, query=query)
+                await cursor.execute(sql, query=query, k=k)
                 return [
                     document({"id": str(row[0]), "metadata": row[1]})
                     for row in await cursor.fetchall()
@@ -1202,4 +1168,11 @@ async def anative_selection(
             raise ValueError(
                 "Current VecDB table layout cannot be used on a legacy database"
             )
-        return "vecdb", version
+        db_version = cursor.var(str, size=128)
+        compatibility = cursor.var(str, size=128)
+        await cursor.execute(
+            COMPATIBILITY_SQL, db_version=db_version, compatibility=compatibility
+        )
+        return _compatible_backend(
+            version, compatibility.getvalue(), kind, backend
+        ), version

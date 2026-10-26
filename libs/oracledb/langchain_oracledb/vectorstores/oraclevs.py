@@ -1515,19 +1515,6 @@ class OracleVS(VectorStore):
 
         return await self.aadd_texts(texts=texts, metadatas=metadatas, **kwargs)
 
-    def _vecdb_inputs(self, texts: Iterable[str], metadatas: Any, ids: Any) -> tuple:
-        texts = list(texts)
-        if ids is not None and len(ids) != len(texts):
-            raise ValueError("Text and ID batch sizes must match")
-        if metadatas is not None and len(metadatas) != len(texts):
-            raise ValueError("Text and metadata batch sizes must match")
-        _, original_ids = get_processed_ids(texts, metadatas, ids)
-        return (
-            texts,
-            metadatas if metadatas is not None else [{} for _ in texts],
-            original_ids,
-        )
-
     @_handle_exceptions
     def add_texts(
         self,
@@ -1558,16 +1545,6 @@ class OracleVS(VectorStore):
           List[str]: The ids successfully inserted (and, when mutate_on_duplicate=True,
             also those successfully updated).
         """
-        if self._vecdb is not None:
-            texts, metadatas, ids = self._vecdb_inputs(texts, metadatas, ids)
-            return self._vecdb.add(
-                texts,
-                self._embed_documents(list(texts)) if texts else [],
-                metadatas,
-                ids,
-                self.mutate_on_duplicate,
-            )
-
         texts = list(texts)
         if ids and len(ids) != len(texts):
             raise ValueError(
@@ -1586,12 +1563,23 @@ class OracleVS(VectorStore):
                     f"but 'texts' has {len(texts)} items."
                 )
 
-        for i, _id in enumerate(original_ids):
-            if INTERNAL_ID_KEY in metadatas[i]:
+        for metadata in metadatas:
+            if INTERNAL_ID_KEY in metadata:
                 raise ValueError(
                     f'Metadata key "{INTERNAL_ID_KEY}" is '
                     "reserved and cannot used in metadata."
                 )
+
+        if self._vecdb is not None:
+            return self._vecdb.add(
+                texts,
+                self._embed_documents(texts) if texts else [],
+                metadatas,
+                original_ids,
+                self.mutate_on_duplicate,
+            )
+
+        for i, _id in enumerate(original_ids):
             metadatas[i][INTERNAL_ID_KEY] = _id
 
         # with OracleEmbeddings, embeddings are generated in the database during insert;
@@ -1747,13 +1735,6 @@ class OracleVS(VectorStore):
           List[str]: The ids successfully inserted (and, when mutate_on_duplicate=True,
             also those successfully updated).
         """
-        if self._vecdb is not None:
-            texts, metadatas, ids = self._vecdb_inputs(texts, metadatas, ids)
-            vectors = await self._aembed_documents(list(texts)) if texts else []
-            return await self._vecdb.run_async(
-                "add", texts, vectors, metadatas, ids, self.mutate_on_duplicate
-            )
-
         texts = list(texts)
         if ids and len(ids) != len(texts):
             raise ValueError(
@@ -1772,12 +1753,20 @@ class OracleVS(VectorStore):
                     f"but 'texts' has {len(texts)} items."
                 )
 
-        for i, _id in enumerate(original_ids):
-            if INTERNAL_ID_KEY in metadatas[i]:
+        for metadata in metadatas:
+            if INTERNAL_ID_KEY in metadata:
                 raise ValueError(
                     f'Metadata key "{INTERNAL_ID_KEY}" is '
                     "reserved and cannot used in metadata."
                 )
+
+        if self._vecdb is not None:
+            vectors = await self._aembed_documents(texts) if texts else []
+            return await self._vecdb.run_async(
+                "add", texts, vectors, metadatas, original_ids, self.mutate_on_duplicate
+            )
+
+        for i, _id in enumerate(original_ids):
             metadatas[i][INTERNAL_ID_KEY] = _id
 
         # with OracleEmbeddings, embeddings are generated in the database during insert;
@@ -1990,12 +1979,6 @@ class OracleVS(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
-        if self._vecdb is not None:
-            return self._vecdb.search(embedding, k, filter, **kwargs)
-        docs_and_scores = []
-
-        embedding_arr: Any = array.array("f", embedding)
-
         db_filter = kwargs.get("db_filter", None)
         if db_filter:
             if filter:
@@ -2004,6 +1987,12 @@ class OracleVS(VectorStore):
                 )
 
             filter = db_filter
+
+        if self._vecdb is not None:
+            return self._vecdb.search(embedding, k, filter, **kwargs)
+        docs_and_scores = []
+
+        embedding_arr: Any = array.array("f", embedding)
 
         query, bind_variables = _get_similarity_search_query(
             self.table_name,
@@ -2039,10 +2028,6 @@ class OracleVS(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
-        if self._vecdb is not None:
-            return await self._vecdb.run_async("search", embedding, k, filter, **kwargs)
-        embedding_arr: Any = array.array("f", embedding)
-
         db_filter = kwargs.get("db_filter", None)
         if db_filter:
             if filter:
@@ -2051,6 +2036,10 @@ class OracleVS(VectorStore):
                 )
 
             filter = db_filter
+
+        if self._vecdb is not None:
+            return await self._vecdb.run_async("search", embedding, k, filter, **kwargs)
+        embedding_arr: Any = array.array("f", embedding)
 
         query, bind_variables = _get_similarity_search_query(
             self.table_name,
@@ -2086,12 +2075,6 @@ class OracleVS(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float, NDArray[np.float32]]]:
-        if self._vecdb is not None:
-            return self._vecdb.search(embedding, k, filter, True, **kwargs)
-        embedding_arr: Any = array.array("f", embedding)
-
-        documents = []
-
         db_filter = kwargs.get("db_filter", None)
         if db_filter:
             if filter:
@@ -2100,6 +2083,12 @@ class OracleVS(VectorStore):
                 )
 
             filter = db_filter
+
+        if self._vecdb is not None:
+            return self._vecdb.search(embedding, k, filter, True, **kwargs)
+        embedding_arr: Any = array.array("f", embedding)
+
+        documents = []
 
         query, bind_variables = _get_similarity_search_query(
             self.table_name,
@@ -2135,12 +2124,6 @@ class OracleVS(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float, NDArray[np.float32]]]:
-        if self._vecdb is not None:
-            return await self._vecdb.run_async(
-                "search", embedding, k, filter, True, **kwargs
-            )
-        embedding_arr: Any = array.array("f", embedding)
-
         db_filter = kwargs.get("db_filter", None)
         if db_filter:
             if filter:
@@ -2149,6 +2132,12 @@ class OracleVS(VectorStore):
                 )
 
             filter = db_filter
+
+        if self._vecdb is not None:
+            return await self._vecdb.run_async(
+                "search", embedding, k, filter, True, **kwargs
+            )
+        embedding_arr: Any = array.array("f", embedding)
 
         query, bind_variables = _get_similarity_search_query(
             self.table_name,

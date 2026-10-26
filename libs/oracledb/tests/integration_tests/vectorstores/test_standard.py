@@ -35,14 +35,20 @@ class TestOracleVSStandardSync(VectorStoreIntegrationTests):
     def vectorstore(self) -> Generator[VectorStore, None, None]:
         """Get an empty vectorstore for unit tests."""
         conn = oracledb.connect(user=username, password=password, dsn=dsn)
-        drop_table_purge(conn, "standard_tests")
-        store = OracleVS(
-            conn,
-            embedding_function=self.get_embeddings(),
-            table_name="standard_tests",
-            mutate_on_duplicate=True,
-        )
-        yield store
+        try:
+            drop_table_purge(conn, "standard_tests")
+            store = OracleVS(
+                conn,
+                embedding_function=self.get_embeddings(),
+                table_name="standard_tests",
+                mutate_on_duplicate=True,
+            )
+            yield store
+        finally:
+            try:
+                drop_table_purge(conn, "standard_tests")
+            finally:
+                conn.close()
 
 
 class TestOracleVSOracleEmbeddingsStandardSync(VectorStoreIntegrationTests):
@@ -55,20 +61,26 @@ class TestOracleVSOracleEmbeddingsStandardSync(VectorStoreIntegrationTests):
     def vectorstore(self) -> Generator[VectorStore, None, None]:
         """Get an empty vectorstore for unit tests."""
         conn = oracledb.connect(user=username, password=password, dsn=dsn)
-        drop_table_purge(conn, "standard_tests")
-        embedder_params = {"provider": "database", "model": "allminilm"}
-        proxy = ""
+        try:
+            drop_table_purge(conn, "standard_tests")
+            embedder_params = {"provider": "database", "model": "allminilm"}
+            proxy = ""
 
-        # instance
-        model = OracleEmbeddings(conn=conn, params=embedder_params, proxy=proxy)
+            # instance
+            model = OracleEmbeddings(conn=conn, params=embedder_params, proxy=proxy)
 
-        store = OracleVS(
-            conn,
-            embedding_function=model,
-            table_name="standard_tests",
-            mutate_on_duplicate=True,
-        )
-        yield store
+            store = OracleVS(
+                conn,
+                embedding_function=model,
+                table_name="standard_tests",
+                mutate_on_duplicate=True,
+            )
+            yield store
+        finally:
+            try:
+                drop_table_purge(conn, "standard_tests")
+            finally:
+                conn.close()
 
 
 class TestOracleVSStandardAsync(VectorStoreIntegrationTests):
@@ -82,18 +94,20 @@ class TestOracleVSStandardAsync(VectorStoreIntegrationTests):
         """Get an empty vectorstore for unit tests (async version)."""
 
         conn = await oracledb.connect_async(user=username, password=password, dsn=dsn)
-        await adrop_table_purge(conn, "standard_tests")
-
-        store = await OracleVS.acreate(
-            conn,
-            embedding_function=self.get_embeddings(),
-            table_name="standard_tests",
-            mutate_on_duplicate=True,
-        )
         try:
+            await adrop_table_purge(conn, "standard_tests")
+            store = await OracleVS.acreate(
+                conn,
+                embedding_function=self.get_embeddings(),
+                table_name="standard_tests",
+                mutate_on_duplicate=True,
+            )
             yield store
         finally:
-            await conn.close()
+            try:
+                await adrop_table_purge(conn, "standard_tests")
+            finally:
+                await conn.close()
 
 
 class TestOracleVSOracleEmbeddingsStandardAsync(VectorStoreIntegrationTests):
@@ -107,22 +121,29 @@ class TestOracleVSOracleEmbeddingsStandardAsync(VectorStoreIntegrationTests):
         """Get an empty vectorstore for unit tests (async version)."""
 
         conn = await oracledb.connect_async(user=username, password=password, dsn=dsn)
-        await adrop_table_purge(conn, "standard_tests")
-        embedder_params = {"provider": "database", "model": "allminilm"}
-        proxy = ""
-
-        # OracleEmbeddings does not support asyncconnection
-        conn_syn = oracledb.connect(user=username, password=password, dsn=dsn)
-        model = OracleEmbeddings(conn=conn_syn, params=embedder_params, proxy=proxy)
-
-        store = await OracleVS.acreate(
-            conn,
-            embedding_function=model,
-            table_name="standard_tests",
-            mutate_on_duplicate=True,
-        )
+        conn_syn = None
         try:
+            await adrop_table_purge(conn, "standard_tests")
+            embedder_params = {"provider": "database", "model": "allminilm"}
+            proxy = ""
+
+            # OracleEmbeddings does not support asyncconnection
+            conn_syn = oracledb.connect(user=username, password=password, dsn=dsn)
+            model = OracleEmbeddings(conn=conn_syn, params=embedder_params, proxy=proxy)
+
+            store = await OracleVS.acreate(
+                conn,
+                embedding_function=model,
+                table_name="standard_tests",
+                mutate_on_duplicate=True,
+            )
             yield store
         finally:
-            conn_syn.close()
-            await conn.close()
+            try:
+                await adrop_table_purge(conn, "standard_tests")
+            finally:
+                try:
+                    if conn_syn is not None:
+                        conn_syn.close()
+                finally:
+                    await conn.close()

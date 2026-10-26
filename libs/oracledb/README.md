@@ -52,11 +52,20 @@ print("Connection successful!")
 #### OracleVS backends and VecDB
 
 `OracleVS` defaults to `backend="auto"`. With a native connection, it checks the
-Oracle Database version and the availability of `DBMS_VECTOR_DATABASE.SEARCH`.
+Oracle Database version, the availability of `DBMS_VECTOR_DATABASE.SEARCH`,
+and the database `COMPATIBLE` setting (read through `DBMS_UTILITY.DB_VERSION`).
 New tables use VecDB on supported databases (23.26.1+), and SQL otherwise.
+The legacy VecDB generation requires `COMPATIBLE >= 23.4.0`; the current schema
+(23.26.3+) requires `COMPATIBLE >= 23.6.0` for its sparse-vector column. A lower
+setting selects SQL for new tables in `auto` mode. Explicit VecDB requests and
+existing VecDB tables instead report the unmet prerequisite before DDL; an
+existing VecDB layout is never treated as an ordinary SQL table. No extra
+constructor parameter is needed.
 Existing ordinary OracleVS tables continue using SQL. Explicit `backend="sql"`
-and `backend="vecdb"` overrides are available. VecDB currently accepts schema-local,
-simple table names. The existing SQL backend retains its identifier support.
+and `backend="vecdb"` overrides are available. Both backends reuse the existing
+OracleVS identifier handling, batch preparation, and index-parameter validators.
+VecDB filters are passed to the SDK or database without a separate operator or
+metadata-path whitelist.
 
 REST uses the optional Oracle VecDB SDK:
 
