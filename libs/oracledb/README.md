@@ -67,6 +67,15 @@ OracleVS identifier handling, batch preparation, and index-parameter validators.
 VecDB filters are passed to the SDK or database without a separate operator or
 metadata-path whitelist.
 
+Native VecDB commands and validation use private copies from the pending
+SQL*Net and JSON hybrid SDK branches. A LangChain adapter handles request binding,
+response shapes, document mapping, and database-generation differences. Source
+commits and intentional differences are recorded in
+[`_vecdb_sdk/SOURCE.md`](langchain_oracledb/_vecdb_sdk/SOURCE.md).
+HNSW index helpers select distribution method `AUTO` unless
+`distribute_params` is supplied explicitly. Hybrid requests use the SDK's JSON
+request format while retaining native async execution and index recovery.
+
 REST uses the optional Oracle VecDB SDK:
 
 ```bash

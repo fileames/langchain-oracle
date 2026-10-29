@@ -583,7 +583,11 @@ def test_native_hybrid_transport_binds_query_and_maps_database_scores():
     assert "DBMS_HYBRID_VECTOR.SEARCH(JSON(:search_params))" in statement
     assert "ORDER BY h.position" in statement
     assert "x' OR 1=1" not in statement
-    assert json.loads(cursor.execute.call_args.kwargs["search_params"]) == params
+    request = json.loads(cursor.execute.call_args.kwargs["search_params"])
+    assert request["hybrid_index_name"] == "HVI"
+    assert request["text"]["json_textcontains"] == params["text"]["json_textcontains"]
+    assert request["text"]["inpath"] == ["$.text"]
+    assert request["return"]["format"] == "JSON"
 
 
 def test_rest_hybrid_reports_unsupported_operation(store):
@@ -833,7 +837,11 @@ async def test_async_native_hybrid_transport_returns_database_scores():
     with patch("langchain_oracledb.vectorstores._vecdb._aget_connection", get):
         docs = await backend.run_async("hybrid_search", params, False)
     assert docs == [Document(id="a", page_content="hello", metadata={"tenant": "one"})]
-    assert json.loads(cursor.execute.call_args.kwargs["search_params"]) == params
+    request = json.loads(cursor.execute.call_args.kwargs["search_params"])
+    assert request["hybrid_index_name"] == "HVI"
+    assert json.loads(request["vector"]["search_vector"]) == [1.0, 0.0]
+    assert params["vector"]["search_vector"] == [1.0, 0.0]
+    assert request["return"]["format"] == "JSON"
     assert "DBMS_HYBRID_VECTOR.SEARCH" in cursor.execute.call_args.args[0]
 
 

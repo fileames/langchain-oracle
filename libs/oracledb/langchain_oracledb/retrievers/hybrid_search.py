@@ -475,9 +475,6 @@ def _get_hybrid_index_ddl(
             raise ValueError("parallel must be a positive integer")
         parallel_str = f"PARALLEL {parallel} "
 
-    def oracle_string_literal(value: str) -> str:
-        return value.replace("'", "''")
-
     column = "text"
     if vectorizer_preference.vs._vecdb is not None:
         from langchain_oracledb.vectorstores._vecdb import CURRENT_VERSION
@@ -492,13 +489,17 @@ def _get_hybrid_index_ddl(
             raise ValueError("Unsupported VecDB metadata column")
         column = metadata_column
 
-    create_index_query = f"""
-    CREATE HYBRID VECTOR INDEX {idx_name} ON 
-    {vectorizer_preference.vs.table_name}({column})
-    PARAMETERS ('{oracle_string_literal(params_str)}') {filter_by_str} {order_by_str} {parallel_str}
-    """  # noqa E501
+    from langchain_oracledb.vectorstores._vecdb_adapter import hybrid_index_ddl
 
-    return create_index_query
+    return (
+        hybrid_index_ddl(
+            idx_name, vectorizer_preference.vs.table_name, column, params_str
+        )
+        + " "
+        + filter_by_str
+        + order_by_str
+        + parallel_str
+    )
 
 
 def _vecdb_hybrid_builder(
@@ -765,35 +766,11 @@ class OracleHybridSearchRetriever(BaseRetriever):
     # apply function to field
     @field_validator("params")
     def validate_params(cls, search_params):
-        search_params = search_params or {}
-        if "search_text" in search_params:
-            raise ValueError(
-                "Cannot provide search_text as a parameter at the top level; "
-                "it is derived from the query."
-            )
+        from langchain_oracledb.vectorstores._vecdb_adapter import (
+            validate_retriever_options,
+        )
 
-        vec = search_params.get("vector") or {}
-        if ("search_text" in vec) or ("search_vector" in vec):
-            raise ValueError(
-                "Cannot provide search_text as a parameter in params['vector']; "
-                "it is derived from the query."
-            )
-
-        txt = search_params.get("text") or {}
-        if ("search_text" in txt) or ("search_vector" in txt) or ("contains" in txt):
-            raise ValueError(
-                "Cannot provide search_text as a parameter in params['text']; "
-                "it is derived from the query."
-            )
-
-        if "return" in search_params:
-            raise ValueError(
-                "Cannot provide return as a parameter in params; "
-                "it is handled internally. Use `return_scores` "
-                "parameter to get the scores."
-            )
-
-        return search_params
+        return validate_retriever_options(search_params or {})
 
     def _get_search_params(self, query: str, **kwargs: Any) -> dict:
         """Build the JSON-serializable parameter dict for DBMS_HYBRID_VECTOR.SEARCH.
@@ -812,44 +789,19 @@ class OracleHybridSearchRetriever(BaseRetriever):
             dict: Parameters suitable for json(:search_params)
                 in DBMS_HYBRID_VECTOR.SEARCH.
         """
+        from langchain_oracledb.vectorstores._vecdb_adapter import (
+            validate_retriever_options,
+        )
+
         search_params = dict(self.params or {})
         search_params.update(kwargs.get("params", {}))
+        validate_retriever_options(search_params)
         search_params["hybrid_index_name"] = self.idx_name
-
-        if "search_text" in search_params:
-            raise ValueError(
-                "Cannot provide search_text as a parameter at the top level; "
-                "it is derived from the query."
-            )
-        if "return" in search_params:
-            raise ValueError(
-                "Cannot provide return as a parameter in params; "
-                "it is handled internally. Use `return_scores` "
-                "parameter to get the scores."
-            )
-
-        if self.search_mode == "hybrid" or self.search_mode == "semantic":
+        if self.search_mode in {"hybrid", "semantic"}:
             search_params["vector"] = dict(search_params.get("vector") or {})
-            if (
-                "search_text" in search_params["vector"]
-                or "search_vector" in search_params["vector"]
-            ):
-                raise ValueError(
-                    "Cannot provide search_text as a parameter in params['vector']; "
-                    "it is derived from the query."
-                )
             search_params["vector"]["search_text"] = query
-        if self.search_mode == "hybrid" or self.search_mode == "keyword":
+        if self.search_mode in {"hybrid", "keyword"}:
             search_params["text"] = dict(search_params.get("text") or {})
-            if (
-                "search_text" in search_params["text"]
-                or "search_vector" in search_params["text"]
-                or "contains" in search_params["text"]
-            ):
-                raise ValueError(
-                    "Cannot provide search_text as a parameter in params['text']; "
-                    "it is derived from the query."
-                )
             search_params["text"]["search_text"] = query
 
         search_params["return"] = {}
@@ -867,30 +819,20 @@ class OracleHybridSearchRetriever(BaseRetriever):
     def _get_vecdb_search_params(
         self, query: str, *, embed: bool = True, **kwargs: Any
     ) -> dict:
-        from .text_search import _generate_accum_query, _positive_int
+        from langchain_oracledb.vectorstores._vecdb_adapter import (
+            retriever_hybrid_options,
+        )
 
-        params = self._get_search_params(query, **kwargs)
-        if {"fetch_k", "rrf_k"} & params.keys():
-            raise ValueError(
-                "Use DBMS_HYBRID_VECTOR.SEARCH parameters for native hybrid search"
-            )
-        params["return"]["topN"] = _positive_int(kwargs.get("k", self.k or 4), "k")
-        if self.search_mode in {"semantic", "hybrid"}:
-            params["vector"].pop("search_text", None)
-            if embed:
-                params["vector"]["search_vector"] = self.vector_store._embed_query(
-                    query
-                )
-        else:
-            params.pop("vector", None)
-        if self.search_mode in {"keyword", "hybrid"}:
-            expression = _generate_accum_query(query, False)
-            params["text"].pop("search_text", None)
-            if "json_textcontains" in params["text"]:
-                raise ValueError("The text path and query are derived internally")
-            params["text"]["json_textcontains"] = ["$.text", expression]
-        else:
-            params.pop("text", None)
+        params = retriever_hybrid_options(
+            query,
+            self.search_mode or "hybrid",
+            self.idx_name,
+            kwargs.get("k", self.k or 4),
+            self.params or {},
+            kwargs.get("params", {}),
+        )
+        if embed and self.search_mode in {"semantic", "hybrid"}:
+            params["vector"]["search_vector"] = self.vector_store._embed_query(query)
         return params
 
     def _get_relevant_documents(self, query: str, **kwargs: Any) -> List[Document]:

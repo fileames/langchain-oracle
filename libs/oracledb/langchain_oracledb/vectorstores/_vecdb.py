@@ -19,6 +19,17 @@ import numpy as np
 import oracledb
 from langchain_core.documents import Document
 
+from ._vecdb_adapter import (
+    CURRENT_VERSION,
+    TEXT_KEY,
+    SQLNetAdapter,
+    _hybrid_documents,
+    as_dict,
+    document,
+    hybrid_search_request,
+    rows,
+    validate_hybrid_request,
+)
 from .utils import (
     DistanceStrategy,
     _aget_connection,
@@ -28,9 +39,7 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-TEXT_KEY = "text"
 LEGACY_VERSION = (23, 26, 1)
-CURRENT_VERSION = (23, 26, 3)
 DENSE_COMPATIBLE = (23, 4, 0)
 SPARSE_COMPATIBLE = (23, 6, 0)
 COMPATIBILITY_SQL = "BEGIN DBMS_UTILITY.DB_VERSION(:db_version, :compatibility); END;"
@@ -54,40 +63,6 @@ def table_identifier(name: str) -> tuple[str, str]:
     """Use the shared identifier handling; return SQL and API forms."""
     quoted = _quote_indentifier(name)
     return quoted, quoted.replace('"', "")
-
-
-def as_dict(response: Any) -> dict[str, Any]:
-    if hasattr(response, "read"):
-        response = response.read()
-    if isinstance(response, str):
-        response = json.loads(response)
-    if hasattr(response, "to_dict"):
-        response = response.to_dict()
-    elif hasattr(response, "model_dump"):
-        response = response.model_dump()
-    if not isinstance(response, dict):
-        raise ValueError("Malformed VecDB response: expected a JSON object")
-    return {key.lower(): value for key, value in response.items()}
-
-
-def rows(response: Any, key: str) -> list[dict[str, Any]]:
-    obj = as_dict(response)
-    result = obj.get(key, obj.get("items"))
-    if not isinstance(result, list):
-        raise ValueError(f"Malformed VecDB response: missing {key} array")
-    return [as_dict(item) for item in result]
-
-
-def document(row: dict[str, Any]) -> Document:
-    from .oraclevs import INTERNAL_ID_KEY
-
-    metadata = dict(row.get("metadata") or {})
-    text = metadata.pop(TEXT_KEY, None)
-    if not isinstance(text, str) or not isinstance(row.get("id"), str):
-        raise ValueError("VecDB document is missing its ID or metadata text")
-    # The SQL backend's private ID field is not part of public metadata.
-    metadata.pop(INTERNAL_ID_KEY, None)
-    return Document(id=row["id"], page_content=text, metadata=metadata)
 
 
 def _columns_sql() -> str:
@@ -256,18 +231,6 @@ def _hybrid_sql(name: str, columns: set[str]) -> str:
     )
 
 
-def _hybrid_documents(result: list, scores: bool) -> list[Document]:
-    docs = []
-    for id_, metadata, score, text_score, vector_score in result:
-        doc = document({"id": str(id_), "metadata": metadata})
-        if scores:
-            doc.metadata.update(
-                score=score, text_score=text_score, vector_score=vector_score
-            )
-        docs.append(doc)
-    return docs
-
-
 class NativeTransport:
     """Execute a bounded set of package calls using caller-owned connections."""
 
@@ -282,63 +245,7 @@ class NativeTransport:
                 return {row[0] for row in cursor.fetchall()}
 
     def _statement(self, operation: str, params: dict) -> tuple[str, dict]:
-        # Function and parameter names are internal constants, not caller SQL.
-        allowed = {
-            "create_vector_table",
-            "describe_vector_table",
-            "drop_vector_table",
-            "upsert_vectors",
-            "list_vectors",
-            "search",
-            "delete_vectors",
-            "create_index",
-        }
-        if operation not in allowed:
-            raise ValueError("Unsupported VecDB operation")
-        params = dict(params)
-        if operation in {
-            "describe_vector_table",
-            "drop_vector_table",
-            "create_vector_table",
-        }:
-            if self.version < CURRENT_VERSION:
-                params["table_name"] = params.pop("name")
-                if operation == "create_vector_table":
-                    params.pop("table_params", None)
-                    params.pop("embed_params", None)
-                    params.update(
-                        auto_generate_id=False,
-                        vector_type="dense",
-                        debug_flags=None,
-                        request_id=None,
-                    )
-        arguments = []
-        for key, value in params.items():
-            if not re.fullmatch(r"[a-z_]+", key):
-                raise ValueError("Invalid internal VecDB parameter")
-            if key in {
-                "vectors",
-                "ids",
-                "query_by",
-                "filters",
-                "advanced_options",
-                "index_params",
-                "table_params",
-                "embed_params",
-                "annotations",
-                "debug_flags",
-            }:
-                params[key] = (
-                    json.dumps(value, allow_nan=False) if value is not None else None
-                )
-                arguments.append(f"{key} => JSON(:{key})")
-            else:
-                arguments.append(f"{key} => :{key}")
-        return (
-            f"BEGIN :result := DBMS_VECTOR_DATABASE.{operation}("
-            f"{', '.join(arguments)}); END;",
-            params,
-        )
+        return SQLNetAdapter(self.version).statement(operation, params)
 
     def call(self, operation: str, **params: Any) -> dict:
         statement, binds = self._statement(operation, params)
@@ -492,6 +399,7 @@ class NativeTransport:
                 ]
 
     def hybrid_search(self, name: str, params: dict, scores: bool) -> list:
+        validate_hybrid_request(params)
         columns = self.columns(name)
         sql = _hybrid_sql(name, columns)
         with _get_connection(self.client) as connection:
@@ -512,7 +420,9 @@ class NativeTransport:
                         "Create a hybrid vector index on the VecDB "
                         "metadata column first"
                     )
-                params = {**params, "hybrid_index_name": existing[0]}
+                params = hybrid_search_request(
+                    name, {**params, "hybrid_index_name": existing[0]}
+                )
                 cursor.setinputsizes(search_params=oracledb.DB_TYPE_CLOB)
                 cursor.execute(sql, search_params=json.dumps(params, allow_nan=False))
                 return _hybrid_documents(cursor.fetchall(), scores)
@@ -811,7 +721,9 @@ class VecDBBackend:
             "distance_metric": self.metric,
             "accuracy": accuracy,
         }
-        advanced = {}
+        # Materialize OracleVS defaults: this server rejects omitted HNSW
+        # construction settings even though the SDK schema makes them optional.
+        advanced = {"neighbors": 32, "efConstruction": 200} if kind == "HNSW" else {}
         ranges = (
             {"neighbors": (2, 2048), "efConstruction": (1, 65535)}
             if kind == "HNSW"
@@ -823,9 +735,16 @@ class VecDBBackend:
                 advanced["partitions" if key == "neighbor_part" else key] = params.pop(
                     key
                 )
+        if kind == "HNSW":
+            mapped["distribute_params"] = {"distribute_method": "AUTO"}
         mapped.update(params)  # The SDK/database validates additional options.
         if advanced:
-            mapped["advanced_params"] = advanced
+            supplied = mapped.get("advanced_params")
+            if supplied is None:
+                mapped["advanced_params"] = advanced
+            elif isinstance(supplied, dict):
+                mapped["advanced_params"] = {**advanced, **supplied}
+            # Leave malformed SDK options for its validation to reject.
         if getattr(self.transport, "version", CURRENT_VERSION) < CURRENT_VERSION:
             mapped["indexing"] = "auto"
             if parallel is not None:
@@ -1087,6 +1006,7 @@ class AsyncNativeTransport(NativeTransport):
                 ]
 
     async def ahybrid_search(self, name: str, params: dict, scores: bool) -> list:
+        validate_hybrid_request(params)
         columns = await self.acolumns(name)
         sql = _hybrid_sql(name, columns)
         async with _aget_connection(self.client) as connection:
@@ -1107,7 +1027,9 @@ class AsyncNativeTransport(NativeTransport):
                         "Create a hybrid vector index on the VecDB "
                         "metadata column first"
                     )
-                params = {**params, "hybrid_index_name": existing[0]}
+                params = hybrid_search_request(
+                    name, {**params, "hybrid_index_name": existing[0]}
+                )
                 cursor.setinputsizes(search_params=oracledb.DB_TYPE_CLOB)
                 await cursor.execute(
                     sql, search_params=json.dumps(params, allow_nan=False)
